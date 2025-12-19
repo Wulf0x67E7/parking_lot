@@ -121,10 +121,18 @@ pub unsafe fn park(
             }
 
             // We timed out, so we now need to remove our thread from the queue
-            let removed = remove_from_bucket(thread_data, key, bucket, timed_out);
+            let removed = remove_from_bucket(
+                key,
+                |current| ptr::eq(current, thread_data),
+                bucket,
+                |key, thread_data, last| {
+                    timed_out(key, last);
+                    thread_data
+                },
+            );
             // There should be no way for our thread to have been removed from the queue
             // if we timed out.
-            debug_assert!(removed);
+            debug_assert!(removed == thread_data);
 
             // Unlock the bucket, we are done
             // SAFETY: We hold the lock here, as required

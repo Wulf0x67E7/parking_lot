@@ -466,56 +466,79 @@ unsafe fn unlock_bucket_pair(bucket1: &Bucket, bucket2: &Bucket) {
     }
 }
 
+struct BucketCursor<'a> {
+    bucket: &'a Bucket,
+    link: &'a Cell<*const ThreadData>,
+    prev: *const ThreadData,
+    current: *const ThreadData,
+}
+impl<'a> BucketCursor<'a> {
+    fn new(bucket: &'a Bucket) -> Self {
+        let link = &bucket.queue_head;
+        let current = bucket.queue_head.get();
+        let prev = ptr::null();
+        Self {
+            bucket,
+            link,
+            prev,
+            current,
+        }
+    }
+    unsafe fn current(&self) -> Option<&'a ThreadData> {
+        unsafe { self.current.as_ref() }
+    }
+    unsafe fn remove(&mut self) -> Option<&'a ThreadData> {
+        let thread_data = unsafe { self.current()? };
+        self.link.set(thread_data.next_in_queue.get());
+        if self.bucket.queue_tail.get() == self.current {
+            self.bucket.queue_tail.set(self.prev);
+        }
+        self.current = self.link.get();
+        Some(thread_data)
+    }
+    unsafe fn next(&mut self) -> Option<&'a ThreadData> {
+        let thread_data = unsafe { self.current()? };
+        self.link = &thread_data.next_in_queue;
+        self.prev = self.current;
+        self.current = self.link.get();
+        unsafe { self.current() }
+    }
+}
+
 /// Removes a thread from the bucket and returns if it succeeded.
 ///
 /// # Safety
 ///
 /// Bucket must be locked
 #[inline]
-unsafe fn remove_from_bucket<'a>(
-    thread_data: &ThreadData,
+unsafe fn remove_from_bucket<'a, U>(
     key: usize,
+    predicate: impl Fn(&ThreadData) -> bool,
     bucket: &Bucket,
-    removed: impl FnOnce(usize, bool),
-) -> bool {
+    callback: impl FnOnce(usize, *const ThreadData, bool) -> U,
+) -> U {
     // We timed out, so we now need to remove our thread from the queue
-    let mut link = &bucket.queue_head;
-    let mut current = bucket.queue_head.get();
-    let mut previous = ptr::null();
+    let mut cursor = BucketCursor::new(bucket);
+    let mut found = ptr::null();
     let mut was_last_thread = true;
-    while !current.is_null() {
-        if current == thread_data {
-            let next = (*current).next_in_queue.get();
-            link.set(next);
-            if bucket.queue_tail.get() == current {
-                bucket.queue_tail.set(previous);
-            } else {
-                // Scan the rest of the queue to see if there are any other
-                // entries with the given key.
-                let mut scan = next;
-                while !scan.is_null() {
-                    if (*scan).key.load(Ordering::Relaxed) == key {
-                        was_last_thread = false;
-                        break;
-                    }
-                    scan = (*scan).next_in_queue.get();
+    'search: while let Some(thread_data) = unsafe { cursor.current() } {
+        if predicate(thread_data) {
+            found = unsafe { cursor.remove() }.unwrap();
+            while was_last_thread && let Some(thread_data) = unsafe { cursor.current() } {
+                if thread_data.key.load(Ordering::Relaxed) == key {
+                    was_last_thread = false;
+                    break 'search;
+                } else {
+                    unsafe { cursor.next() };
                 }
             }
-
-            // Callback to indicate that we timed out, and whether we were the
-            // last thread on the queue.
-            removed(key, was_last_thread);
-            break;
-        } else {
-            if (*current).key.load(Ordering::Relaxed) == key {
-                was_last_thread = false;
-            }
-            link = &(*current).next_in_queue;
-            previous = current;
-            current = link.get();
+            break 'search;
+        } else if thread_data.key.load(Ordering::Relaxed) == key {
+            was_last_thread = false;
         }
+        unsafe { cursor.next() };
     }
-    !current.is_null()
+    callback(key, found, was_last_thread)
 }
 
 /// Result of a park operation.
@@ -666,7 +689,7 @@ pub mod deadlock {
 
 #[cfg(feature = "deadlock_detection")]
 mod deadlock_impl {
-    use super::{get_hashtable, lock_bucket, with_thread_data, ThreadData, NUM_THREADS};
+    use super::{NUM_THREADS, ThreadData, get_hashtable, lock_bucket, with_thread_data};
     use crate::thread_parker::{ThreadParkerT, UnparkHandleT};
     use crate::word_lock::WordLock;
     use backtrace::Backtrace;
@@ -918,9 +941,9 @@ mod deadlock_impl {
 
     // returns all thread cycles in the wait graph
     fn graph_cycles(g: &DiGraphMap<WaitGraphNode, ()>) -> Vec<Vec<*const ThreadData>> {
-        use petgraph::visit::depth_first_search;
         use petgraph::visit::DfsEvent;
         use petgraph::visit::NodeIndexable;
+        use petgraph::visit::depth_first_search;
 
         let mut cycles = HashSet::new();
         let mut path = Vec::with_capacity(g.node_bound());
@@ -947,12 +970,12 @@ mod deadlock_impl {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThreadData, DEFAULT_PARK_TOKEN, DEFAULT_UNPARK_TOKEN};
+    use super::{DEFAULT_PARK_TOKEN, DEFAULT_UNPARK_TOKEN, ThreadData};
     use std::{
         ptr,
         sync::{
-            atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering},
         },
         thread,
         time::Duration,
