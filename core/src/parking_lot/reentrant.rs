@@ -1,72 +1,12 @@
+use smallvec::SmallVec;
+
 use crate::{
-    deadlock,
-    parking_lot::{
-        lock_bucket, lock_bucket_checked, remove_from_bucket, with_thread_data, Bucket, ThreadData,
-    },
+    ParkResult, ParkToken, UnparkResult, UnparkToken, deadlock,
+    parking_lot::{BucketCursor, QueueToken, remove_from_bucket, with_thread_data},
     thread_parker::{ThreadParkerT, UnparkHandleT},
-    ParkResult, ParkToken, UnparkResult, UnparkToken,
 };
 use core::{ptr, sync::atomic::Ordering};
-use std::{fmt::Debug, sync::atomic::AtomicUsize, time::Instant};
-
-pub struct QueueToken<'a> {
-    key: usize,
-    bucket: Option<(bool, &'a Bucket)>,
-}
-impl Debug for QueueToken<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QueueToken")
-            .field("key", &self.key)
-            .field("locked", &self.bucket.is_some())
-            .finish()
-    }
-}
-
-impl<'a> QueueToken<'a> {
-    pub fn new(key: usize) -> Self {
-        Self { key, bucket: None }
-    }
-    fn new_locked(key: usize) -> Self {
-        let bucket = lock_bucket(key);
-        Self {
-            key,
-            bucket: Some((true, bucket)),
-        }
-    }
-    fn new_lock_checked(key: &AtomicUsize) -> Self {
-        let (key, bucket) = lock_bucket_checked(key);
-        Self {
-            key,
-            bucket: Some((true, bucket)),
-        }
-    }
-    pub fn key(&self) -> usize {
-        self.key
-    }
-    fn with_lock<U>(mut self, f: impl FnOnce(&QueueToken<'a>, &Bucket) -> U) -> U {
-        let bucket = self
-            .bucket
-            .get_or_insert_with(|| (true, lock_bucket(self.key)))
-            .1;
-        let ret = f(&self, bucket);
-        drop(self);
-        ret
-    }
-    fn dup(&self) -> QueueToken<'a> {
-        Self {
-            key: self.key,
-            bucket: self.bucket.map(|(_, bucket)| (false, bucket)),
-        }
-    }
-}
-impl Drop for QueueToken<'_> {
-    fn drop(&mut self) {
-        if let Some((true, bucket)) = self.bucket {
-            // SAFETY: We are the primary holder of the lock here, as required
-            unsafe { bucket.mutex.unlock() };
-        }
-    }
-}
+use std::time::Instant;
 
 /// Parks the current thread in the queue associated with the given key.
 ///
@@ -98,101 +38,101 @@ impl Drop for QueueToken<'_> {
 /// to call `unpark_one`, `unpark_all`, `unpark_requeue` or `unpark_filter`, but
 /// it is not allowed to call `park` or panic.
 #[inline]
-pub unsafe fn park<'a>(
-    queue: QueueToken<'a>,
-    park_token: impl FnOnce(QueueToken<'a>) -> Option<ParkToken>,
-    validate: impl FnOnce(QueueToken<'a>) -> bool,
+pub unsafe fn park(
+    queue: QueueToken<'_>,
+    park_token: impl FnOnce(&QueueToken<'_>) -> Option<ParkToken>,
+    validate: impl FnOnce(&QueueToken<'_>) -> bool,
     before_sleep: impl FnOnce(),
-    removed: impl FnOnce(QueueToken<'a>, ParkResult, bool),
+    removed: impl FnOnce(&QueueToken<'_>, ParkResult, bool),
     timeout: Option<Instant>,
 ) -> ParkResult {
-    // Grab our thread data, this also ensures that the hash table exists
-    with_thread_data(|thread_data| {
-        // Lock the bucket for the given key
-        let removed = match queue.with_lock(|queue, bucket| {
-            // If the validation function fails, just return
-            let Some(park_token) = park_token(queue.dup()) else {
-                return Err(ParkResult::Invalid);
+    unsafe {
+        // Grab our thread data, this also ensures that the hash table exists
+        with_thread_data(|thread_data| {
+            // Lock the bucket for the given key
+            let removed = match queue.with_lock(|queue, bucket| {
+                // If the validation function fails, just return
+                let Some(park_token) = park_token(queue) else {
+                    return Err(ParkResult::Invalid);
+                };
+
+                // Append our thread data to the queue and unlock the bucket
+                thread_data.parked_with_timeout.set(timeout.is_some());
+                thread_data.next_in_queue.set(ptr::null());
+                thread_data.key.store(queue.key, Ordering::Relaxed);
+                thread_data.park_token.set(park_token);
+                thread_data.parker.prepare_park();
+                if !bucket.queue_head.get().is_null() {
+                    (*bucket.queue_tail.get()).next_in_queue.set(thread_data);
+                } else {
+                    bucket.queue_head.set(thread_data);
+                }
+                bucket.queue_tail.set(thread_data);
+
+                if !validate(queue) {
+                    let removed = remove_from_bucket(
+                        queue.dup(),
+                        |current| ptr::eq(current, thread_data),
+                        |_, thread_data, last| {
+                            removed(queue, ParkResult::Invalid, last);
+                            thread_data
+                        },
+                    );
+                    debug_assert!(removed == thread_data);
+                    return Err(ParkResult::Invalid);
+                }
+
+                Ok(removed)
+            }) {
+                Ok(removed) => removed,
+                Err(res) => return res,
+            };
+            // Invoke the pre-sleep callback
+            before_sleep();
+
+            // Park our thread and determine whether we were woken up by an unpark
+            // or by our timeout. Note that this isn't precise: we can still be
+            // unparked since we are still in the queue.
+            let unparked = match timeout {
+                Some(timeout) => thread_data.parker.park_until(timeout),
+                None => {
+                    thread_data.parker.park();
+                    // call deadlock detection on_unpark hook
+                    deadlock::on_unpark(thread_data);
+                    true
+                }
             };
 
-            // Append our thread data to the queue and unlock the bucket
-            thread_data.parked_with_timeout.set(timeout.is_some());
-            thread_data.next_in_queue.set(ptr::null());
-            thread_data.key.store(queue.key, Ordering::Relaxed);
-            thread_data.park_token.set(park_token);
-            thread_data.parker.prepare_park();
-            if !bucket.queue_head.get().is_null() {
-                (*bucket.queue_tail.get()).next_in_queue.set(thread_data);
-            } else {
-                bucket.queue_head.set(thread_data);
+            // If we were unparked, return now
+            if unparked {
+                return ParkResult::Unparked(thread_data.unpark_token.get());
             }
-            bucket.queue_tail.set(thread_data);
 
-            if !validate(queue.dup()) {
+            // Lock our bucket again. Note that the hashtable may have been rehashed in
+            // the meantime. Our key may also have changed if we were requeued.
+            QueueToken::new_lock_checked(&thread_data.key).with_lock(|queue, _| {
+                // Now we need to check again if we were unparked or timed out. Unlike the
+                // last check this is precise because we hold the bucket lock.
+                if !thread_data.parker.timed_out() {
+                    return ParkResult::Unparked(thread_data.unpark_token.get());
+                }
+
+                // There should be no way for our thread to have been removed from the queue
+                // if we timed out.
                 let removed = remove_from_bucket(
-                    queue.key(),
+                    queue.dup(),
                     |current| ptr::eq(current, thread_data),
-                    bucket,
-                    |_, thread_data, last| {
-                        removed(queue.dup(), ParkResult::Invalid, last);
+                    |queue, thread_data, last| {
+                        removed(queue, ParkResult::TimedOut, last);
                         thread_data
                     },
                 );
                 debug_assert!(removed == thread_data);
-                return Err(ParkResult::Invalid);
-            }
 
-            Ok(removed)
-        }) {
-            Ok(removed) => removed,
-            Err(res) => return res,
-        };
-        // Invoke the pre-sleep callback
-        before_sleep();
-
-        // Park our thread and determine whether we were woken up by an unpark
-        // or by our timeout. Note that this isn't precise: we can still be
-        // unparked since we are still in the queue.
-        let unparked = match timeout {
-            Some(timeout) => thread_data.parker.park_until(timeout),
-            None => {
-                thread_data.parker.park();
-                // call deadlock detection on_unpark hook
-                deadlock::on_unpark(thread_data);
-                true
-            }
-        };
-
-        // If we were unparked, return now
-        if unparked {
-            return ParkResult::Unparked(thread_data.unpark_token.get());
-        }
-
-        // Lock our bucket again. Note that the hashtable may have been rehashed in
-        // the meantime. Our key may also have changed if we were requeued.
-        QueueToken::new_lock_checked(&thread_data.key).with_lock(|queue, bucket| {
-            // Now we need to check again if we were unparked or timed out. Unlike the
-            // last check this is precise because we hold the bucket lock.
-            if !thread_data.parker.timed_out() {
-                return ParkResult::Unparked(thread_data.unpark_token.get());
-            }
-
-            // There should be no way for our thread to have been removed from the queue
-            // if we timed out.
-            let removed = remove_from_bucket(
-                queue.key(),
-                |current| ptr::eq(current, thread_data),
-                bucket,
-                |_, thread_data, last| {
-                    removed(queue.dup(), ParkResult::TimedOut, last);
-                    thread_data
-                },
-            );
-            debug_assert!(removed == thread_data);
-
-            ParkResult::TimedOut
+                ParkResult::TimedOut
+            })
         })
-    })
+    }
 }
 
 /// Unparks one thread from the queue associated with the given key.
@@ -219,27 +159,26 @@ pub unsafe fn park<'a>(
 /// from the context of an asynchronous signal handler may result in undefined
 /// behavior, including corruption of internal state and/or deadlocks.
 #[inline]
-pub unsafe fn unpark_one<'a>(
-    queue: QueueToken<'a>,
-    callback: impl FnOnce(QueueToken<'a>, UnparkResult) -> UnparkToken,
+pub unsafe fn unpark_one(
+    queue: QueueToken<'_>,
+    callback: impl FnOnce(&QueueToken<'_>, UnparkResult) -> UnparkToken,
 ) -> UnparkResult {
-    // Lock the bucket for the given key
-    let mut result = UnparkResult::default();
-    match queue.with_lock(|queue, bucket| {
-        remove_from_bucket(
-            queue.key(),
-            |_| true,
-            bucket,
-            |_, thread_data, last| {
+    unsafe {
+        // Lock the bucket for the given key
+        let mut result = UnparkResult::default();
+        match remove_from_bucket(
+            queue.dup(),
+            |thread_data| thread_data.key.load(Ordering::Relaxed) == queue.key(),
+            |queue, thread_data, last| {
                 if let Some(thread_data) = thread_data.as_ref() {
+                    // Update the result
                     result.unparked_threads = 1;
                     result.have_more_threads = !last;
-                    result.be_fair = (*bucket.fair_timeout.get()).should_timeout();
-                    let token = callback(queue.dup(), result);
-
+                    result.be_fair = queue
+                        .dup()
+                        .with_lock(|_, bucket| (*bucket.fair_timeout.get()).should_timeout());
                     // Set the token for the target thread
-                    thread_data.unpark_token.set(token);
-
+                    thread_data.unpark_token.set(callback(queue, result));
                     // This is a bit tricky: we first lock the ThreadParker to prevent
                     // the thread from exiting and freeing its ThreadData if its wait
                     // times out. Then we unlock the queue since we don't want to keep
@@ -248,18 +187,62 @@ pub unsafe fn unpark_one<'a>(
                     Ok(thread_data.parker.unpark_lock())
                 } else {
                     // No threads with a matching key were found in the bucket
-                    Err(callback(queue.dup(), result))
+                    Err(callback(queue, result))
                 }
             },
-        )
-    }) {
-        Ok(handle) => {
-            debug_assert_eq!(result.unparked_threads, 1);
-            handle.unpark();
+        ) {
+            Ok(handle) => {
+                debug_assert_eq!(result.unparked_threads, 1);
+                handle.unpark();
+            }
+            Err(_) => {
+                debug_assert_eq!(result, UnparkResult::default());
+            }
         }
-        Err(_) => {
-            debug_assert_eq!(result, UnparkResult::default());
-        }
+        result
     }
-    result
+}
+
+/// Unparks all threads in the queue associated with the given key.
+///
+/// The given `UnparkToken` is passed to all unparked threads.
+///
+/// This function returns the number of threads that were unparked.
+///
+/// # Safety
+///
+/// You should only call this function with an address that you control, since
+/// you could otherwise interfere with the operation of other synchronization
+/// primitives.
+///
+/// The `parking_lot` functions are not re-entrant and calling this method
+/// from the context of an asynchronous signal handler may result in undefined
+/// behavior, including corruption of internal state and/or deadlocks.
+#[inline]
+pub unsafe fn unpark_all(
+    queue: QueueToken<'_>,
+    mut callback: impl FnMut(ParkToken) -> UnparkToken,
+) -> usize {
+    let mut threads = SmallVec::<[_; 8]>::new();
+    queue.with_lock(|queue, bucket| {
+        let mut cursor = BucketCursor::new(bucket);
+        while let Some(thread_data) = unsafe { cursor.current() } {
+            if thread_data.key.load(Ordering::Relaxed) == queue.key() {
+                unsafe { cursor.remove() };
+                thread_data
+                    .unpark_token
+                    .set(callback(thread_data.park_token.get()));
+                threads.push(unsafe { thread_data.parker.unpark_lock() });
+            } else {
+                unsafe { cursor.next() };
+            }
+        }
+    });
+    // Now that we are outside the lock, wake up all the threads that we removed
+    // from the queue.
+    let num_threads = threads.len();
+    for handle in threads.into_iter() {
+        unsafe { handle.unpark() };
+    }
+    num_threads
 }

@@ -13,6 +13,7 @@ use core::{
     ptr,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+use std::fmt::Debug;
 use std::time::Duration;
 
 // Don't use Instant on wasm32-unknown-unknown, it just panics.
@@ -323,20 +324,22 @@ fn grow_hashtable(num_threads: usize) {
 ///
 /// The given `table` must only contain buckets with correctly constructed linked lists.
 unsafe fn rehash_bucket_into(bucket: &'static Bucket, table: &mut HashTable) {
-    let mut current: *const ThreadData = bucket.queue_head.get();
-    while !current.is_null() {
-        let next = (*current).next_in_queue.get();
-        let hash = hash((*current).key.load(Ordering::Relaxed), table.hash_bits);
-        if table.entries[hash].queue_tail.get().is_null() {
-            table.entries[hash].queue_head.set(current);
-        } else {
-            (*table.entries[hash].queue_tail.get())
-                .next_in_queue
-                .set(current);
+    unsafe {
+        let mut current: *const ThreadData = bucket.queue_head.get();
+        while !current.is_null() {
+            let next = (*current).next_in_queue.get();
+            let hash = hash((*current).key.load(Ordering::Relaxed), table.hash_bits);
+            if table.entries[hash].queue_tail.get().is_null() {
+                table.entries[hash].queue_head.set(current);
+            } else {
+                (*table.entries[hash].queue_tail.get())
+                    .next_in_queue
+                    .set(current);
+            }
+            table.entries[hash].queue_tail.set(current);
+            (*current).next_in_queue.set(ptr::null());
+            current = next;
         }
-        table.entries[hash].queue_tail.set(current);
-        (*current).next_in_queue.set(ptr::null());
-        current = next;
     }
 }
 
@@ -460,9 +463,11 @@ fn lock_bucket_pair(key1: usize, key2: usize) -> (&'static Bucket, &'static Buck
 /// Both buckets must be locked
 #[inline]
 unsafe fn unlock_bucket_pair(bucket1: &Bucket, bucket2: &Bucket) {
-    bucket1.mutex.unlock();
-    if !ptr::eq(bucket1, bucket2) {
-        bucket2.mutex.unlock();
+    unsafe {
+        bucket1.mutex.unlock();
+        if !ptr::eq(bucket1, bucket2) {
+            bucket2.mutex.unlock();
+        }
     }
 }
 
@@ -512,33 +517,92 @@ impl<'a> BucketCursor<'a> {
 /// Bucket must be locked
 #[inline]
 unsafe fn remove_from_bucket<'a, U>(
-    key: usize,
-    predicate: impl Fn(&ThreadData) -> bool,
-    bucket: &Bucket,
-    callback: impl FnOnce(usize, *const ThreadData, bool) -> U,
+    queue: QueueToken<'a>,
+    mut predicate: impl FnMut(&ThreadData) -> bool,
+    callback: impl FnOnce(&QueueToken<'a>, *const ThreadData, bool) -> U,
 ) -> U {
-    // We timed out, so we now need to remove our thread from the queue
-    let mut cursor = BucketCursor::new(bucket);
-    let mut found = ptr::null();
-    let mut was_last_thread = true;
-    'search: while let Some(thread_data) = unsafe { cursor.current() } {
-        if predicate(thread_data) {
-            found = unsafe { cursor.remove() }.unwrap();
-            while was_last_thread && let Some(thread_data) = unsafe { cursor.current() } {
-                if thread_data.key.load(Ordering::Relaxed) == key {
-                    was_last_thread = false;
-                    break 'search;
-                } else {
-                    unsafe { cursor.next() };
+    queue.with_lock(|queue, bucket| {
+        let mut cursor = BucketCursor::new(bucket);
+        let mut found = ptr::null();
+        let mut was_last_thread = true;
+        'search: while let Some(thread_data) = unsafe { cursor.current() } {
+            if predicate(thread_data) {
+                found = unsafe { cursor.remove() }.unwrap();
+                while was_last_thread && let Some(thread_data) = unsafe { cursor.current() } {
+                    if thread_data.key.load(Ordering::Relaxed) == queue.key() {
+                        was_last_thread = false;
+                        break 'search;
+                    } else {
+                        unsafe { cursor.next() };
+                    }
                 }
+                break 'search;
+            } else if thread_data.key.load(Ordering::Relaxed) == queue.key() {
+                was_last_thread = false;
             }
-            break 'search;
-        } else if thread_data.key.load(Ordering::Relaxed) == key {
-            was_last_thread = false;
+            unsafe { cursor.next() };
         }
-        unsafe { cursor.next() };
+        callback(queue, found, was_last_thread)
+    })
+}
+
+pub struct QueueToken<'a> {
+    key: usize,
+    bucket: Option<(bool, &'a Bucket)>,
+}
+impl Debug for QueueToken<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueToken")
+            .field("key", &self.key)
+            .field("locked", &self.bucket.is_some())
+            .finish()
     }
-    callback(key, found, was_last_thread)
+}
+
+impl<'a> QueueToken<'a> {
+    pub fn new(key: usize) -> Self {
+        Self { key, bucket: None }
+    }
+    pub(self) fn new_locked(key: usize) -> Self {
+        let bucket = lock_bucket(key);
+        Self {
+            key,
+            bucket: Some((true, bucket)),
+        }
+    }
+    pub(self) fn new_lock_checked(key: &AtomicUsize) -> Self {
+        let (key, bucket) = lock_bucket_checked(key);
+        Self {
+            key,
+            bucket: Some((true, bucket)),
+        }
+    }
+    pub fn key(&self) -> usize {
+        self.key
+    }
+    pub(self) fn with_lock<U>(mut self, f: impl FnOnce(&QueueToken<'a>, &Bucket) -> U) -> U {
+        let bucket = self
+            .bucket
+            .get_or_insert_with(|| (true, lock_bucket(self.key)))
+            .1;
+        let ret = f(&self, bucket);
+        drop(self);
+        ret
+    }
+    pub fn dup(&self) -> QueueToken<'_> {
+        Self {
+            key: self.key,
+            bucket: self.bucket.map(|(_, bucket)| (false, bucket)),
+        }
+    }
+}
+impl Drop for QueueToken<'_> {
+    fn drop(&mut self) {
+        if let Some((true, bucket)) = self.bucket {
+            // SAFETY: We are the primary holder of the lock here, as required
+            unsafe { bucket.mutex.unlock() };
+        }
+    }
 }
 
 /// Result of a park operation.

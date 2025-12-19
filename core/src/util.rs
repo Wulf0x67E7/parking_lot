@@ -12,20 +12,20 @@ pub trait UncheckedOptionExt<T> {
 
 impl<T> UncheckedOptionExt<T> for Option<T> {
     #[inline]
-    unsafe fn unchecked_unwrap(self) -> T {
+    unsafe fn unchecked_unwrap(self) -> T { unsafe {
         match self {
             Some(x) => x,
             None => unreachable(),
         }
-    }
+    }}
 }
 
 // hint::unreachable_unchecked() in release mode
 #[inline]
-unsafe fn unreachable() -> ! {
+unsafe fn unreachable() -> ! { unsafe {
     if cfg!(debug_assertions) {
         unreachable!();
     } else {
         core::hint::unreachable_unchecked()
     }
-}
+}}

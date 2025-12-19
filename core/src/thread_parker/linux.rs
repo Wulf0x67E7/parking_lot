@@ -69,24 +69,26 @@ impl super::ThreadParkerT for ThreadParker {
 
     #[inline]
     unsafe fn park_until(&self, timeout: Instant) -> bool {
-        while self.futex.load(Ordering::Acquire) != 0 {
-            let now = Instant::now();
-            if timeout <= now {
-                return false;
+        unsafe {
+            while self.futex.load(Ordering::Acquire) != 0 {
+                let now = Instant::now();
+                if timeout <= now {
+                    return false;
+                }
+                let diff = timeout - now;
+                if diff.as_secs() as libc::time_t as u64 != diff.as_secs() {
+                    // Timeout overflowed, just sleep indefinitely
+                    self.park();
+                    return true;
+                }
+                // SAFETY: libc::timespec is zero initializable.
+                let mut ts: libc::timespec = std::mem::zeroed();
+                ts.tv_sec = diff.as_secs() as libc::time_t;
+                ts.tv_nsec = diff.subsec_nanos() as tv_nsec_t;
+                self.futex_wait(Some(ts));
             }
-            let diff = timeout - now;
-            if diff.as_secs() as libc::time_t as u64 != diff.as_secs() {
-                // Timeout overflowed, just sleep indefinitely
-                self.park();
-                return true;
-            }
-            // SAFETY: libc::timespec is zero initializable.
-            let mut ts: libc::timespec = std::mem::zeroed();
-            ts.tv_sec = diff.as_secs() as libc::time_t;
-            ts.tv_nsec = diff.subsec_nanos() as tv_nsec_t;
-            self.futex_wait(Some(ts));
+            true
         }
-        true
     }
 
     // Locks the parker to prevent the target thread from exiting. This is
@@ -135,17 +137,19 @@ pub struct UnparkHandle {
 impl super::UnparkHandleT for UnparkHandle {
     #[inline]
     unsafe fn unpark(self) {
-        // The thread data may have been freed at this point, but it doesn't
-        // matter since the syscall will just return EFAULT in that case.
-        let r = libc::syscall(
-            libc::SYS_futex,
-            self.futex,
-            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-            1,
-        );
-        debug_assert!(r == 0 || r == 1 || r == -1);
-        if r == -1 {
-            debug_assert_eq!(errno(), libc::EFAULT);
+        unsafe {
+            // The thread data may have been freed at this point, but it doesn't
+            // matter since the syscall will just return EFAULT in that case.
+            let r = libc::syscall(
+                libc::SYS_futex,
+                self.futex,
+                libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+                1,
+            );
+            debug_assert!(r == 0 || r == 1 || r == -1);
+            if r == -1 {
+                debug_assert_eq!(errno(), libc::EFAULT);
+            }
         }
     }
 }
