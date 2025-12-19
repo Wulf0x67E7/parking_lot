@@ -59,7 +59,10 @@ mod util;
 mod word_lock;
 
 pub use self::parking_lot::deadlock;
-pub use self::parking_lot::{park, unpark_all, unpark_filter, unpark_one, unpark_requeue};
+pub use self::parking_lot::{
+    normal::{park, unpark_all, unpark_filter, unpark_one, unpark_requeue},
+    reentrant,
+};
 pub use self::parking_lot::{
     FilterOp, ParkResult, ParkToken, RequeueOp, UnparkResult, UnparkToken,
 };
